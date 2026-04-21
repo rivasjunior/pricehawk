@@ -73,6 +73,18 @@ const MIN_TITLE_OVERLAP = 0.55
 const MIN_NUMERIC_COVERAGE = 0.5
 const MIN_PRICE_RATIO = 0.35
 
+const normalizeSku = (text = '') =>
+  text
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, '')
+    .trim()
+
+const formatSkuInput = (text = '') =>
+  text
+    .toUpperCase()
+    .replace(/[^A-Z0-9\-./]+/g, '')
+    .trim()
+
 const normalizeText = (text = '') =>
   text
     .normalize('NFD')
@@ -117,13 +129,28 @@ const getReferencePrice = (item) => {
   return candidates.length ? Math.max(...candidates) : null
 }
 
+const getSearchQuery = (title, sku) => {
+  const normalizedSku = normalizeSku(sku)
+  const normalizedTitle = title.trim()
+  if (!normalizedSku) return ''
+  return normalizedTitle ? `${normalizedSku} ${normalizedTitle}` : normalizedSku
+}
+
+const hasSkuMatch = (expectedSku, candidateTitle) => {
+  const normalizedSku = normalizeSku(expectedSku)
+  if (!normalizedSku) return false
+  return normalizeSku(candidateTitle).includes(normalizedSku)
+}
+
 const pickBestRelevantResult = (item, results = []) => {
   const referencePrice = getReferencePrice(item)
   const priceFloor = referencePrice ? referencePrice * MIN_PRICE_RATIO : 0
+  const requiresSkuMatch = Boolean(normalizeSku(item.productSku))
 
   const relevantResults = results
     .map(result => ({ result, match: getTitleMatch(item.title, result.title) }))
     .filter(({ result, match }) => {
+      if (requiresSkuMatch && !hasSkuMatch(item.productSku, result.title)) return false
       if (match.hasAccessoryHint) return false
       if (match.overlap < MIN_TITLE_OVERLAP) return false
       if (match.numericCoverage < MIN_NUMERIC_COVERAGE) return false
@@ -154,6 +181,7 @@ const saveWatchlist = (list) => {
 export default function PriceHawk() {
   const [watchlist,   setWatchlist]   = useState([])
   const [query,       setQuery]       = useState('')
+  const [productSku,  setProductSku]  = useState('')
   const [searching,   setSearching]   = useState(false)
   const [results,     setResults]     = useState(null)
   const [error,       setError]       = useState('')
@@ -174,15 +202,24 @@ export default function PriceHawk() {
   }, [watchlist, mounted])
 
   // ── search ──────────────────────────────────────────────
-  const search = useCallback(async (q) => {
-    if (!q.trim()) return
+  const search = useCallback(async (title, sku) => {
+    const searchSku = formatSkuInput(sku)
+    const searchQuery = getSearchQuery(title, searchSku)
+
+    if (!searchQuery) {
+      setError('Informe o SKU do produto para buscar.')
+      setResults(null)
+      setActiveTab('search')
+      return
+    }
+
     setSearching(true)
     setError('')
     setResults(null)
     setActiveTab('search')
     try {
-      const data = await searchML(q, 8)
-      setResults(data)
+      const data = await searchML(searchQuery, 8)
+      setResults({ ...data, searchTitle: title.trim(), productSku: searchSku })
     } catch (e) {
       setError(e.message)
     } finally {
@@ -190,17 +227,26 @@ export default function PriceHawk() {
     }
   }, [])
 
-  const onKeyDown = (e) => { if (e.key === 'Enter') search(query) }
+  const onKeyDown = (e) => { if (e.key === 'Enter') search(query, productSku) }
 
   // ── add to watchlist ─────────────────────────────────────
-  const addToWatch = (item, targetPrice) => {
-    const already = watchlist.find(w => w.id === item.id)
+  const addToWatch = (item, targetPrice, sku) => {
+    const formattedSku = formatSkuInput(sku)
+    const normalizedSku = normalizeSku(formattedSku)
+
+    if (!normalizedSku) {
+      notify('⚠️ Informe o SKU para monitorar o produto.')
+      return
+    }
+
+    const already = watchlist.find(w => normalizeSku(w.productSku) === normalizedSku)
     if (already) {
       notify('⚠️ Produto já está na lista!')
       return
     }
     const entry = {
       ...item,
+      productSku:   formattedSku,
       targetPrice:  targetPrice || null,
       addedAt:      Date.now(),
       priceHistory: [{ price: item.price, date: Date.now() }],
@@ -220,16 +266,30 @@ export default function PriceHawk() {
     )
   }
 
+  const updateProductSku = (id, val) => {
+    const formattedSku = formatSkuInput(val)
+    setWatchlist(prev =>
+      prev.map(w => w.id === id ? { ...w, productSku: formattedSku } : w)
+    )
+  }
+
   // ── refresh all watchlist prices ─────────────────────────
   const refreshAll = useCallback(async () => {
     if (!watchlist.length || refreshing) return
     setRefreshing(true)
     let alerts = []
+    let skippedWithoutSku = 0
 
     const updated = await Promise.all(
       watchlist.map(async (item) => {
         try {
-          const data = await searchML(item.title, REFRESH_SEARCH_LIMIT)
+          const searchQuery = getSearchQuery(item.title, item.productSku)
+          if (!searchQuery) {
+            skippedWithoutSku += 1
+            return item
+          }
+
+          const data = await searchML(searchQuery, REFRESH_SEARCH_LIMIT)
           if (!data.results?.length) return item
 
           const bestMatch = pickBestRelevantResult(item, data.results)
@@ -253,6 +313,8 @@ export default function PriceHawk() {
 
     if (alerts.length) {
       notify(`🔔 ${alerts.length} alerta(s)!\n${alerts.join('\n')}`, 5000)
+    } else if (skippedWithoutSku) {
+      notify(`⚠️ ${skippedWithoutSku} produto(s) sem SKU. Preencha o código para atualizar.`)
     } else {
       notify('✅ Preços atualizados!')
     }
@@ -303,21 +365,38 @@ export default function PriceHawk() {
 
         {/* ── search bar ── */}
         <div className="search-wrap">
-          <div className="search-box">
-            <span className="search-icon">🔍</span>
-            <input
-              className="search-input"
-              type="text"
-              placeholder="Ex: iPhone 15 Pro, Notebook Dell, AirFryer..."
-              value={query}
-              onChange={e => setQuery(e.target.value)}
-              onKeyDown={onKeyDown}
-            />
-            {query && (
-              <button className="clear-btn" onClick={() => { setQuery(''); setResults(null); setActiveTab('watch') }}>✕</button>
-            )}
+          <div className="search-fields">
+            <div className="search-box">
+              <span className="search-icon">🔍</span>
+              <input
+                className="search-input"
+                type="text"
+                placeholder="Nome do produto para contexto visual"
+                value={query}
+                onChange={e => setQuery(e.target.value)}
+                onKeyDown={onKeyDown}
+              />
+              {query && (
+                <button className="clear-btn" onClick={() => { setQuery(''); setResults(null); setActiveTab('watch') }}>✕</button>
+              )}
+            </div>
+            <div className="search-box search-box--sku">
+              <span className="search-code">SKU</span>
+              <input
+                className="search-input search-input--sku"
+                type="text"
+                placeholder="Código obrigatório"
+                value={productSku}
+                onChange={e => setProductSku(formatSkuInput(e.target.value))}
+                onKeyDown={onKeyDown}
+              />
+            </div>
           </div>
-          <button className="search-btn" onClick={() => search(query)} disabled={searching || !query.trim()}>
+          <button
+            className="search-btn"
+            onClick={() => search(query, productSku)}
+            disabled={searching || !normalizeSku(productSku)}
+          >
             {searching ? <span className="spin">⟳</span> : 'Buscar'}
           </button>
         </div>
@@ -373,6 +452,16 @@ export default function PriceHawk() {
                                 {item.freeShipping && <span className="free-ship">Frete grátis</span>}
                                 {item.installments && <span className="installments">{item.installments}</span>}
                               </div>
+                              <div className="sku-row">
+                                <label className="sku-label">SKU</label>
+                                <input
+                                  type="text"
+                                  className="sku-input"
+                                  placeholder="Obrigatório para refresh"
+                                  value={item.productSku || ''}
+                                  onChange={e => updateProductSku(item.id, e.target.value)}
+                                />
+                              </div>
                               <div className="price-row">
                                 <span className="current-price">{fmt(item.price)}</span>
                                 {drop !== 0 && (
@@ -425,9 +514,10 @@ export default function PriceHawk() {
               {results && !searching && (
                 <>
                   <div className="results-header">
-                    <span className="results-query">"{results.query}"</span>
+                    <span className="results-query">{results.searchTitle ? `"${results.searchTitle}"` : 'Busca por SKU'}</span>
                     <span className="results-total">{results.total.toLocaleString()} resultados</span>
                   </div>
+                  <div className="results-sku">SKU: {results.productSku}</div>
 
                   {/* price stats */}
                   <div className="stats-bar">
@@ -443,7 +533,7 @@ export default function PriceHawk() {
                       const savePct = results.stats.max > 0
                         ? ((results.stats.max - item.price) / results.stats.max) * 100
                         : 0
-                      const inWatch = watchlist.some(w => w.id === item.id)
+                      const inWatch = watchlist.some(w => normalizeSku(w.productSku) === normalizeSku(results.productSku))
                       return (
                         <div key={item.id} className={`result-card ${idx === 0 ? 'best' : ''}`}>
                           {idx === 0 && <div className="best-badge">⚡ Melhor Preço</div>}
@@ -467,7 +557,7 @@ export default function PriceHawk() {
                                 <a href={item.link} target="_blank" rel="noreferrer" className="view-btn">
                                   Ver no ML →
                                 </a>
-                                <AddButton inWatch={inWatch} onAdd={(target) => addToWatch(item, target)} />
+                                <AddButton inWatch={inWatch} onAdd={(target) => addToWatch(item, target, results.productSku)} />
                               </div>
                             </div>
                           </div>
@@ -480,7 +570,7 @@ export default function PriceHawk() {
               {!results && !searching && !error && (
                 <div className="empty">
                   <div className="empty-icon">🔍</div>
-                  <p>Digite um produto e pressione Buscar</p>
+                  <p>Informe o SKU e pressione Buscar</p>
                 </div>
               )}
             </div>
@@ -509,13 +599,17 @@ export default function PriceHawk() {
 
         /* search */
         .search-wrap { display: flex; gap: 10px; padding: 18px 16px 0; }
+        .search-fields { flex: 1; display: flex; flex-direction: column; gap: 10px; }
         .search-box { flex: 1; display: flex; align-items: center; background: #0f1318;
           border: 1px solid #1e2530; border-radius: 12px; padding: 0 14px; gap: 10px;
           transition: border-color .2s; }
         .search-box:focus-within { border-color: #4ade8066; }
+        .search-box--sku { border-color: #2b3440; }
         .search-icon { font-size: 16px; flex-shrink: 0; opacity: .5; }
+        .search-code { font-size: 11px; color: #4ade80; letter-spacing: 1px; }
         .search-input { flex: 1; background: transparent; border: none; outline: none;
           color: #e2e8f0; font-family: 'DM Mono', monospace; font-size: 14px; padding: 14px 0; }
+        .search-input--sku { text-transform: uppercase; }
         .search-input::placeholder { color: #3a4450; }
         .clear-btn { background: none; border: none; color: #3a4450; cursor: pointer; font-size: 14px;
           padding: 4px; transition: color .2s; }
@@ -590,6 +684,13 @@ export default function PriceHawk() {
         .score-label { font-size: 11px; font-weight: 600; }
         .lowest { font-size: 10px; color: #4a5568; }
 
+        .sku-row { display: flex; align-items: center; gap: 8px; }
+        .sku-label { font-size: 10px; color: #4a5568; flex-shrink: 0; }
+        .sku-input { background: #0f1318; border: 1px solid #1e2530; border-radius: 8px;
+          padding: 5px 10px; color: #e2e8f0; font-family: 'DM Mono', monospace; font-size: 12px;
+          width: 180px; outline: none; text-transform: uppercase; }
+        .sku-input:focus { border-color: #4ade8044; }
+
         .target-row { display: flex; align-items: center; gap: 8px; margin-top: 2px; }
         .target-label { font-size: 10px; color: #4a5568; flex-shrink: 0; }
         .target-input { background: #0f1318; border: 1px solid #1e2530; border-radius: 8px;
@@ -612,6 +713,7 @@ export default function PriceHawk() {
           margin-bottom: 12px; }
         .results-query { font-family: 'Syne', sans-serif; font-weight: 700; font-size: 15px; color: #f1f5f9; }
         .results-total { font-size: 11px; color: #4a5568; }
+        .results-sku { font-size: 11px; color: #4ade80; margin-bottom: 12px; }
 
         /* stats bar */
         .stats-bar { display: flex; background: #0c1015; border: 1px solid #1a2030;
@@ -647,6 +749,13 @@ export default function PriceHawk() {
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.5} }
         @keyframes spin  { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
         @keyframes slideDown { from{opacity:0;transform:translateX(-50%) translateY(-10px)} to{opacity:1;transform:translateX(-50%) translateY(0)} }
+
+        @media (max-width: 640px) {
+          .search-wrap { flex-direction: column; }
+          .search-btn { width: 100%; }
+          .sku-row, .target-row { flex-wrap: wrap; }
+          .sku-input { width: 100%; }
+        }
       `}</style>
     </>
   )
