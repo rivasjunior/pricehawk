@@ -1,6 +1,43 @@
 import { useState, useEffect, useCallback } from 'react'
 import Head from 'next/head'
 
+// ─── ML API (chamada direta do browser — suporta CORS) ──────
+async function searchML(q, limit = 8) {
+  const url = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(q)}&limit=${limit}&sort=price_asc`
+  const res  = await fetch(url, { headers: { Accept: 'application/json' } })
+  if (!res.ok) throw new Error(`Mercado Livre retornou erro ${res.status}`)
+  const data = await res.json()
+
+  const results = (data.results || []).map(item => ({
+    id:           item.id,
+    title:        item.title,
+    price:        item.price,
+    currency:     item.currency_id,
+    condition:    item.condition === 'new' ? 'Novo' : 'Usado',
+    seller:       item.seller?.nickname || 'Vendedor',
+    link:         item.permalink,
+    thumbnail:    item.thumbnail?.replace('http://', 'https://'),
+    installments: item.installments
+      ? `${item.installments.quantity}x R$ ${item.installments.amount.toFixed(2).replace('.', ',')}`
+      : null,
+    freeShipping: item.shipping?.free_shipping || false,
+    available:    item.available_quantity || 0,
+    sold:         item.sold_quantity || 0,
+  }))
+
+  const prices = results.map(r => r.price)
+  return {
+    query:   q,
+    total:   data.paging?.total || 0,
+    results,
+    stats: {
+      min: prices.length ? Math.min(...prices) : 0,
+      max: prices.length ? Math.max(...prices) : 0,
+      avg: prices.length ? Math.round(prices.reduce((a, b) => a + b, 0) / prices.length * 100) / 100 : 0,
+    },
+  }
+}
+
 // ─── helpers ────────────────────────────────────────────────
 const fmt = (n) =>
   n != null
@@ -63,9 +100,7 @@ export default function PriceHawk() {
     setResults(null)
     setActiveTab('search')
     try {
-      const res  = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=8`)
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error || 'Erro desconhecido')
+      const data = await searchML(q, 8)
       setResults(data)
     } catch (e) {
       setError(e.message)
@@ -113,9 +148,8 @@ export default function PriceHawk() {
     const updated = await Promise.all(
       watchlist.map(async (item) => {
         try {
-          const res  = await fetch(`/api/search?q=${encodeURIComponent(item.title)}&limit=3`)
-          const data = await res.json()
-          if (!res.ok || !data.results?.length) return item
+          const data = await searchML(item.title, 3)
+          if (!data.results?.length) return item
 
           const newPrice = data.stats.min
           const history  = [{ price: newPrice, date: Date.now() }, ...(item.priceHistory || [])].slice(0, 20)

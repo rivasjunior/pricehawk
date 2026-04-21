@@ -1,7 +1,13 @@
-# ⚡ PriceHawk — Guia de Instalação
+# ⚡ PriceHawk
+
+**Monitore preços do Mercado Livre em tempo real — no celular, tablet e PC.**
+
+🔗 **App ao vivo:** https://pricehawkrivas-ot6aaxgy0-rivasjuniors-projects.vercel.app
+
+---
 
 ## O que é isso?
-Um app web que roda no celular, tablet e PC.
+Um PWA que roda no celular, tablet e PC.
 Você digita o nome de um produto e ele busca os melhores preços no Mercado Livre em tempo real.
 
 ---
