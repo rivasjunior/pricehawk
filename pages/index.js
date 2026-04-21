@@ -58,6 +58,87 @@ const scoreLabel = (pct) => {
   return '🔴 Alto'
 }
 
+const TITLE_STOPWORDS = new Set([
+  'a', 'an', 'as', 'de', 'do', 'da', 'dos', 'das', 'e', 'em', 'com', 'sem',
+  'para', 'por', 'no', 'na', 'nos', 'nas', 'o', 'os', 'the', 'um', 'uma',
+])
+
+const ACCESSORY_TOKENS = new Set([
+  'adaptador', 'bumper', 'cabo', 'capa', 'capinha', 'carregador', 'case',
+  'cover', 'fonte', 'mousepad', 'pelicula', 'protecao', 'protetora', 'suporte',
+])
+
+const REFRESH_SEARCH_LIMIT = 12
+const MIN_TITLE_OVERLAP = 0.55
+const MIN_NUMERIC_COVERAGE = 0.5
+const MIN_PRICE_RATIO = 0.35
+
+const normalizeText = (text = '') =>
+  text
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim()
+
+const tokenizeTitle = (text = '') =>
+  normalizeText(text).split(/\s+/).filter(Boolean)
+
+const getComparableTokens = (text = '') =>
+  tokenizeTitle(text).filter(token =>
+    !TITLE_STOPWORDS.has(token) && (/\d/.test(token) || token.length >= 3)
+  )
+
+const getTitleMatch = (expectedTitle, candidateTitle) => {
+  const expectedTokens = getComparableTokens(expectedTitle)
+  const candidateTokens = tokenizeTitle(candidateTitle)
+  const candidateTokenSet = new Set(candidateTokens)
+  const expectedIsAccessory = tokenizeTitle(expectedTitle).some(token => ACCESSORY_TOKENS.has(token))
+  const hasAccessoryHint = !expectedIsAccessory && candidateTokens.some(token => ACCESSORY_TOKENS.has(token))
+
+  if (!expectedTokens.length) {
+    return { overlap: 0, numericCoverage: 1, hasAccessoryHint }
+  }
+
+  const matchedTokens = expectedTokens.filter(token => candidateTokenSet.has(token))
+  const numericTokens = expectedTokens.filter(token => /\d/.test(token))
+  const matchedNumericTokens = numericTokens.filter(token => candidateTokenSet.has(token))
+
+  return {
+    overlap: matchedTokens.length / expectedTokens.length,
+    numericCoverage: numericTokens.length ? matchedNumericTokens.length / numericTokens.length : 1,
+    hasAccessoryHint,
+  }
+}
+
+const getReferencePrice = (item) => {
+  const originalPrice = item.priceHistory?.[item.priceHistory.length - 1]?.price
+  const candidates = [item.price, originalPrice].filter(price => Number.isFinite(price) && price > 0)
+  return candidates.length ? Math.max(...candidates) : null
+}
+
+const pickBestRelevantResult = (item, results = []) => {
+  const referencePrice = getReferencePrice(item)
+  const priceFloor = referencePrice ? referencePrice * MIN_PRICE_RATIO : 0
+
+  const relevantResults = results
+    .map(result => ({ result, match: getTitleMatch(item.title, result.title) }))
+    .filter(({ result, match }) => {
+      if (match.hasAccessoryHint) return false
+      if (match.overlap < MIN_TITLE_OVERLAP) return false
+      if (match.numericCoverage < MIN_NUMERIC_COVERAGE) return false
+      if (priceFloor && result.price < priceFloor) return false
+      return true
+    })
+    .sort((left, right) =>
+      left.result.price - right.result.price ||
+      right.match.overlap - left.match.overlap ||
+      right.match.numericCoverage - left.match.numericCoverage
+    )
+
+  return relevantResults[0]?.result || null
+}
+
 // ─── localStorage ────────────────────────────────────────────
 const STORAGE_KEY = 'pricehawk_watchlist'
 const loadWatchlist = () => {
@@ -148,10 +229,13 @@ export default function PriceHawk() {
     const updated = await Promise.all(
       watchlist.map(async (item) => {
         try {
-          const data = await searchML(item.title, 3)
+          const data = await searchML(item.title, REFRESH_SEARCH_LIMIT)
           if (!data.results?.length) return item
 
-          const newPrice = data.stats.min
+          const bestMatch = pickBestRelevantResult(item, data.results)
+          if (!bestMatch) return item
+
+          const newPrice = bestMatch.price
           const history  = [{ price: newPrice, date: Date.now() }, ...(item.priceHistory || [])].slice(0, 20)
           const lowest   = Math.min(newPrice, item.lowestSeen || newPrice)
 
