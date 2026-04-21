@@ -14,17 +14,23 @@ export default async function handler(req, res) {
   }
 
   try {
-    // API pública do Mercado Livre — sem autenticação necessária
     const mlUrl = `https://api.mercadolibre.com/sites/MLB/search?q=${encodeURIComponent(q)}&limit=${limit}&sort=price_asc`
 
     const response = await fetch(mlUrl, {
       headers: {
-        'User-Agent': 'PriceHawk/1.0',
+        'User-Agent': 'Mozilla/5.0 (compatible; PriceHawk/1.0)',
+        'Accept': 'application/json',
       },
+      signal: AbortSignal.timeout(8000),
     })
 
     if (!response.ok) {
-      throw new Error(`ML API error: ${response.status}`)
+      const body = await response.text().catch(() => '')
+      console.error(`ML API error: ${response.status}`, body)
+      return res.status(502).json({
+        error: `Mercado Livre retornou erro ${response.status}. Tente novamente.`,
+        detail: body.slice(0, 200),
+      })
     }
 
     const data = await response.json()
@@ -64,7 +70,13 @@ export default async function handler(req, res) {
       },
     })
   } catch (err) {
-    console.error('Search error:', err)
-    return res.status(500).json({ error: 'Erro ao buscar preços. Tente novamente.' })
+    const isTimeout = err.name === 'TimeoutError' || err.name === 'AbortError'
+    console.error('Search error:', err.name, err.message)
+    return res.status(500).json({
+      error: isTimeout
+        ? 'Tempo limite excedido. Tente novamente.'
+        : 'Erro ao buscar preços. Tente novamente.',
+      detail: err.message,
+    })
   }
 }
